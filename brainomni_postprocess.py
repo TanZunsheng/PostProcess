@@ -310,7 +310,15 @@ def process_single_file(
     
     # 断点续传：检查输出目录是否已存在
     try:
-        relative_path = file_path.relative_to(file_path.parents[4])  # 从 sub-XX 开始
+        # 动态找出相对于 subject 的路径
+        parts = file_path.parts
+        if "preprocessing" in parts:
+            idx = parts.index("preprocessing")
+            relative_path = Path(*parts[idx+1:]) # sub-XX/...
+        else:
+            # 回退逻辑
+            relative_path = file_path.relative_to(file_path.parents[4])
+        
         output_subdir = output_dir / relative_path.parent / file_path.stem
         
         if output_subdir.exists():
@@ -336,96 +344,72 @@ def process_single_file(
         is_bids = 'derivatives' in str(file_path) and 'preprocessing' in str(file_path)
         
         if is_bids:
-            # 使用 MNE-BIDS 读取以自动加载 electrodes.tsv 中的坐标
+            # 尝试解析 BIDS 文件名中的 subject 和 session
+            fname = file_path.stem.replace('_eeg', '')
+            fname_parts = fname.split('_')
+            
+            subject = None
+            session = None
+            for part in fname_parts:
+                if part.startswith('sub-'):
+                    subject = part.replace('sub-', '')
+                elif part.startswith('ses-'):
+                    session = part.replace('ses-', '')
+            
+            # 使用标准读取（绕过 MNE-BIDS 严格验证，如 split 文件的 acq_time 问题）
+            if file_path.suffix == '.vhdr':
+                raw = mne.io.read_raw_brainvision(str(file_path), preload=True, verbose='ERROR')
+            elif file_path.suffix == '.fif':
+                raw = mne.io.read_raw_fif(str(file_path), preload=True, verbose='ERROR')
+            else:
+                raise ValueError(f"不支持的文件格式: {file_path.suffix}")
+                
+            # 手动从 electrodes.tsv 加载坐标
             try:
-                import mne_bids
-                from mne_bids import BIDSPath
+                import pandas as pd
+                # 直接从文件所在的 eeg/ 目录查找 electrodes.tsv
+                # 避免 parents[N] 层级计算错误（BIDS结构深度因数据集而异）
+                eeg_dir = file_path.parent  # .../sub-XX/ses-YY/eeg/ 或 .../sub-XX/eeg/
                 
-                # 从文件路径构建 BIDSPath
-                parts = file_path.parts
-                bids_root_idx = parts.index('preprocessing')
-                bids_root = Path(*parts[:bids_root_idx+1])
+                electrodes_file = None
+                # 优先匹配含 session 的命名格式（如 ThingsEEG: sub-01_ses-01_space-CapTrak_electrodes.tsv）
+                # 再回落到不含 session 的格式（如 Brennan_Hale2019: sub-S11_space-CapTrak_electrodes.tsv）
+                candidate_names = []
+                if session:
+                    candidate_names += [
+                        f'sub-{subject}_ses-{session}_space-CapTrak_electrodes.tsv',
+                        f'sub-{subject}_ses-{session}_electrodes.tsv',
+                    ]
+                candidate_names += [
+                    f'sub-{subject}_space-CapTrak_electrodes.tsv',
+                    f'sub-{subject}_electrodes.tsv',
+                ]
+                for name in candidate_names:
+                    electrode_path = eeg_dir / name
+                    if electrode_path.exists():
+                        electrodes_file = electrode_path
+                        break
                 
-                # 解析 BIDS 文件名
-                fname = file_path.stem.replace('_eeg', '')
-                fname_parts = fname.split('_')
-                
-                # 提取 subject, task, run
-                subject = None
-                task = None
-                run = None
-                session = None
-                
-                for part in fname_parts:
-                    if part.startswith('sub-'):
-                        subject = part.replace('sub-', '')
-                    elif part.startswith('task-'):
-                        task = part.replace('task-', '')
-                    elif part.startswith('run-'):
-                        run = part.replace('run-', '')
-                    elif part.startswith('ses-'):
-                        session = part.replace('ses-', '')
-                
-                bids_path = BIDSPath(
-                    subject=subject,
-                    session=session,
-                    task=task,
-                    run=run,
-                    datatype='eeg',
-                    root=bids_root
-                )
-                
-                
-                raw = mne_bids.read_raw_bids(bids_path, verbose='ERROR')
-                logger.info("  使用 MNE-BIDS 读取（自动加载 electrodes.tsv 坐标）")
-                
-                # MNE-BIDS 可能不会自动设置 montage，需要手动加载
-                if raw.get_montage() is None:
-                    # 尝试从 electrodes.tsv 加载坐标
-                    try:
-                        import pandas as pd
-                        # 查找 electrodes.tsv 文件
-                        subj_dir = bids_root / f'sub-{subject}'
-                        if session:
-                            subj_dir = subj_dir / f'ses-{session}'
-                        
-                        # electrodes.tsv 可能在 subject 层级
-                        electrodes_file = None
-                        for electrode_path in [subj_dir / f'sub-{subject}_space-CapTrak_electrodes.tsv',
-                                               subj_dir / 'eeg' / f'sub-{subject}_space-CapTrak_electrodes.tsv',
-                                               subj_dir / f'sub-{subject}_electrodes.tsv',
-                                               subj_dir / 'eeg' / f'sub-{subject}_electrodes.tsv']:
-                            if electrode_path.exists():
-                                electrodes_file = electrode_path
-                                break
-                        
-                        if electrodes_file:
-                            df = pd.read_csv(electrodes_file, sep='\t')
-                            # 创建 ch_pos 字典
-                            ch_pos = {}
-                            for _, row in df.iterrows():
-                                ch_name = row['name']
-                                if ch_name in raw.ch_names:
-                                    ch_pos[ch_name] = np.array([row['x'], row['y'], row['z']])
-                            
-                            if ch_pos:
-                                montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
-                                # 抑制关于misc通道(如Cz参考电极)的警告
-                                import warnings
-                                with warnings.catch_warnings():
-                                    warnings.filterwarnings('ignore', message='Not setting position.*misc channel')
-                                    raw.set_montage(montage)
-                                logger.info(f"  从 electrodes.tsv 加载 {len(ch_pos)} 个通道坐标")
-                    except Exception as e:
-                        logger.warning(f"  无法从 electrodes.tsv 加载坐标: {e}")
-            except Exception as e:
-                logger.warning(f"  MNE-BIDS 读取失败，回退到标准读取: {e}")
-                if file_path.suffix == '.vhdr':
-                    raw = mne.io.read_raw_brainvision(str(file_path), preload=True, verbose='ERROR')
-                elif file_path.suffix == '.fif':
-                    raw = mne.io.read_raw_fif(str(file_path), preload=True, verbose='ERROR')
+                if electrodes_file:
+                    df = pd.read_csv(electrodes_file, sep='\t')
+                    ch_pos = {}
+                    for _, row in df.iterrows():
+                        ch_name = row['name']
+                        if ch_name in raw.ch_names:
+                            ch_pos[ch_name] = np.array([row['x'], row['y'], row['z']])
+                    
+                    if ch_pos:
+                        montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame='head')
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='Not setting position.*misc channel')
+                            raw.set_montage(montage)
+                        logger.info(f"  BIDS 格式，从 electrodes.tsv 成功加载 {len(ch_pos)} 个通道坐标 ({electrodes_file.name})")
                 else:
-                    raise ValueError(f"不支持的文件格式: {file_path.suffix}")
+                    logger.warning(f"  未找到 electrodes.tsv，已搜索目录: {eeg_dir}")
+            except Exception as e:
+                logger.warning(f"  尝试从 electrodes.tsv 加载坐标失败: {e}")
+
         else:
             # 非 BIDS 格式，使用标准读取
             if file_path.suffix == '.vhdr':
@@ -511,6 +495,9 @@ def process_single_file(
         else:
             logger.info("  BIDS 格式，使用 electrodes.tsv 中的坐标，跳过 montage 设置")
         
+        # 定义需要显式排除的非EEG物理通道（与 PENCI 导联场保持一致）
+        non_eeg_channels = {"Cz"}
+        
         # 4.5 检查并移除没有有效坐标的通道（如 CB1, CB2 等不在 montage 中的通道）
         invalid_channels = []
         montage_check = raw.get_montage()
@@ -521,7 +508,9 @@ def process_single_file(
                 # 从 montage 检查坐标
                 ch_pos_dict = montage_pos_check['ch_pos']
                 for ch_name in raw.ch_names:
-                    if ch_name not in ch_pos_dict:
+                    if ch_name in non_eeg_channels:
+                        invalid_channels.append(ch_name)
+                    elif ch_name not in ch_pos_dict:
                         invalid_channels.append(ch_name)
                     else:
                         coord = ch_pos_dict[ch_name]
@@ -530,15 +519,19 @@ def process_single_file(
             else:
                 # 回退到检查 info
                 for ch in raw.info['chs']:
+                    ch_name = ch['ch_name']
                     loc = ch['loc'][:3]
-                    if np.isnan(loc).any() or np.allclose(loc, 0, atol=1e-10):
-                        invalid_channels.append(ch['ch_name'])
+                    if ch_name in non_eeg_channels or np.isnan(loc).any() or np.allclose(loc, 0, atol=1e-10):
+                        if ch_name not in invalid_channels:
+                            invalid_channels.append(ch_name)
         else:
             # 没有 montage，检查 info
             for ch in raw.info['chs']:
+                ch_name = ch['ch_name']
                 loc = ch['loc'][:3]
-                if np.isnan(loc).any() or np.allclose(loc, 0, atol=1e-10):
-                    invalid_channels.append(ch['ch_name'])
+                if ch_name in non_eeg_channels or np.isnan(loc).any() or np.allclose(loc, 0, atol=1e-10):
+                    if ch_name not in invalid_channels:
+                        invalid_channels.append(ch_name)
         
         if invalid_channels:
             logger.warning(f"  移除无效坐标通道 ({len(invalid_channels)}个): {invalid_channels}")
@@ -568,7 +561,14 @@ def process_single_file(
         
         # 8. 创建输出目录
         # 保持 BIDS 结构
-        relative_path = file_path.relative_to(file_path.parents[4])  # 从 sub-XX 开始
+        parts = file_path.parts
+        if "preprocessing" in parts:
+            idx = parts.index("preprocessing")
+            relative_path = Path(*parts[idx+1:]) # sub-XX/ses-YY/eeg/... 或 sub-XX/eeg/...
+        else:
+            # 回退逻辑
+            relative_path = file_path.relative_to(file_path.parents[4])
+        
         output_subdir = output_dir / relative_path.parent / file_path.stem
         output_subdir.mkdir(parents=True, exist_ok=True)
         
@@ -722,8 +722,17 @@ def _load_pt_metadata(pt_file: Path, output_dir_name: str) -> dict:
         # 提取数据集名称
         parts = pt_file.parts
         try:
-            output_idx = parts.index(output_dir_name)
-            dataset_name = parts[output_idx + 1] if output_idx + 1 < len(parts) else "unknown"
+            # PENCIData 目录的下一级是数据集名称 (如 PENCIData/ThingsEEG/sub-01/...)
+            if "PENCIData" in parts:
+                idx = parts.index("PENCIData")
+                dataset_name = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
+            # 否则尝试查找指定的输出目录名
+            elif output_dir_name in parts:
+                idx = parts.index(output_dir_name)
+                # 输出目录通常就是数据集本身的目录，或者下一级
+                dataset_name = parts[idx] if parts[idx] != "BrainOmniPostProcess" else (parts[idx + 1] if idx + 1 < len(parts) else "unknown")
+            else:
+                dataset_name = "unknown"
         except ValueError:
             dataset_name = "unknown"
         
@@ -856,9 +865,17 @@ def generate_brainomni_metadata(
         for ch, items in channel_groups.items():
             random.shuffle(items)
             n = len(items)
-            n_train = int(n * train_ratio)
+            # 重要：不要用 int() 分别截断 train/val 导致余数被丢弃。
+            # 这里让 val/test 先按比例取整，train 直接吃掉剩余，保证每组总数严格为 n。
             n_val = int(n * val_ratio)
-            
+            n_test = int(n * test_ratio) if test_ratio > 0 else 0
+            n_train = n - n_val - n_test
+
+            # 兜底：防止用户传入异常比例导致负数
+            if n_train < 0:
+                n_train = max(n - n_val, 0)
+                n_test = max(n - n_train - n_val, 0)
+
             train_list.extend(items[:n_train])
             val_list.extend(items[n_train:n_train + n_val])
             if test_ratio > 0:
@@ -874,7 +891,9 @@ def generate_brainomni_metadata(
     logger.info("保存元数据文件...")
     # 根据是否有 dataset_name 决定目录名
     if dataset_name:
-        metadata_dir = output_dir / f"{dataset_name}-metadata"
+        # 统一放到数据集目录的父目录旁边：PENCIData/{ds_name}-metadata/
+        # 对 Broderick 子数据集：PENCIData/Broderick2018/{subds_name}-metadata/
+        metadata_dir = output_dir.parent / f"{dataset_name}-metadata"
     else:
         metadata_dir = output_dir / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -1030,7 +1049,7 @@ def main():
     # 生成 BrainOmni 训练所需的元数据
     if not args.no_generate_metadata:
         # 如果指定了数据集，传递数据集名称
-        generate_brainomni_metadata(root_output_dir, dataset_name=args.dataset)
+        generate_brainomni_metadata(output_dir, dataset_name=args.dataset)
     
     elapsed = time.time() - start_time
     logger.info(f"总耗时: {elapsed:.2f} 秒")

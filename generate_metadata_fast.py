@@ -102,13 +102,8 @@ def generate_metadata_fast(
         
         ch_info = dir_channels[dir_path]
         
-        # 提取数据集名称（从目录路径）
-        parts = dir_path.parts
-        try:
-            idx = parts.index(output_dir.name)
-            dataset_name = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
-        except ValueError:
-            dataset_name = "unknown"
+        # 当前 output_dir 就是具体数据集的目录，所以 dataset_name 即为 output_dir.name
+        dataset_name = output_dir.name
         
         for pt_file in files:
             metadata_list.append({
@@ -142,9 +137,15 @@ def generate_metadata_fast(
         for ch, items in channel_groups.items():
             random.shuffle(items)
             n = len(items)
-            n_train = int(n * train_ratio)
+            # 不要单独对 train/val 做 int() 截断，否则余数会被丢弃。
             n_val = int(n * val_ratio)
-            
+            n_test = int(n * test_ratio) if test_ratio > 0 else 0
+            n_train = n - n_val - n_test
+
+            if n_train < 0:
+                n_train = max(n - n_val, 0)
+                n_test = max(n - n_train - n_val, 0)
+
             train_list.extend(items[:n_train])
             val_list.extend(items[n_train:n_train + n_val])
             if test_ratio > 0:
@@ -157,7 +158,8 @@ def generate_metadata_fast(
     
     # 7. 保存元数据
     logger.info("保存元数据文件...")
-    metadata_dir = output_dir / "metadata"
+    # 统一放到数据集目录的父目录旁边：PENCIData/{ds_name}-metadata/
+    metadata_dir = output_dir.parent / f"{output_dir.name}-metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
     
     splits = [("train", train_list), ("val", val_list)]
@@ -167,7 +169,7 @@ def generate_metadata_fast(
     for name, data_list in splits:
         filepath = metadata_dir / f"{name}.json"
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data_list, f, ensure_ascii=False)  # 不用 indent，节省空间
+            json.dump(data_list, f, indent=4, ensure_ascii=False)  # 增加 indent 格式化
         logger.info(f"  ✓ {name}.json: {len(data_list):,} 条记录")
     
     # 8. 统计

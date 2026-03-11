@@ -17,7 +17,7 @@ DATASET="ThingsEEG"
 TIME_WINDOW=10        # 时间窗口（秒）
 STRIDE=5              # 滑动步长（秒）
 SFREQ=256             # 目标采样率（Hz）
-WORKERS=8             # 并行进程数
+WORKERS=20             # 并行进程数
 
 # 激活环境
 echo "激活 Conda 环境: $CONDA_ENV"

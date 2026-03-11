@@ -45,8 +45,10 @@ if __name__ == '__main__':
     )
     
     print("\n✓ 完成! 元数据已保存到:")
-    print(f"  {output_dir}/metadata/train.json")
-    print(f"  {output_dir}/metadata/val.json")
+    # 生成逻辑会把 metadata 放到数据集目录的父目录旁边：{ds_name}-metadata/
+    meta_dir = output_dir.parent / f"{output_dir.name}-metadata"
+    print(f"  {meta_dir}/train.json")
+    print(f"  {meta_dir}/val.json")
     if args.test_ratio > 0:
-        print(f"  {output_dir}/metadata/test.json")
+        print(f"  {meta_dir}/test.json")
 
